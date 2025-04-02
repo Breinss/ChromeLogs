@@ -784,11 +784,30 @@ const saveFinalHarFiles = () => {
       // Also create a combined HAR file for convenience
       const combinedHarPath = path.join(sessionDir, "network_all.har");
 
-      // Flatten all events from all tabs into a single array - use faster spread method
+      // Flatten all events from all tabs into a single array - safely check for iterability
       const allEvents = [];
       for (const events of networkEvents.values()) {
-        if (events.length > 0) {
-          allEvents.push(...events);
+        // Check if events is an array or array-like iterable before spreading
+        if (events && Array.isArray(events)) {
+          if (events.length > 0) {
+            allEvents.push(...events);
+          }
+        } else if (
+          events &&
+          typeof events === "object" &&
+          events.array &&
+          Array.isArray(events.array)
+        ) {
+          // Handle BoundedArray objects which store their items in an 'array' property
+          if (events.array.length > 0) {
+            allEvents.push(...events.array);
+          }
+        } else if (events && typeof events.getItems === "function") {
+          // Handle objects with a getItems() method that returns an array (like BoundedArray)
+          const items = events.getItems();
+          if (Array.isArray(items) && items.length > 0) {
+            allEvents.push(...items);
+          }
         }
       }
 
