@@ -1,0 +1,10 @@
+This directory will contain user guide images.
+Required images:
+- logo_placeholder.png
+- download_placeholder.png
+- cmd_navigate_placeholder.png
+- chrome_start_placeholder.png
+- run_logger_placeholder.png
+- recording_placeholder.png
+- session_complete_placeholder.png
+- session_folder_placeholder.png

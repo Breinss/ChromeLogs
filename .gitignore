@@ -1,0 +1,41 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Generated files
+session_*/
+emergency_*/
+*.har
+*.har.gz
+*.har.part
+*.json.gz
+
+# Logs
+*.log
+logs/
+console_logs/
+network_flushes/
+console_flushes/
+final_har_files/
+
+# OS specific files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor specific files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Debug files
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment variables
+.env
+.env.local
+.env.*.local
