@@ -144,7 +144,175 @@ class BoundedArray {
   }
 }
 
-// Replace updateStatusLine with throttled version
+// Add to utility functions
+const chalk = require("chalk"); // If not installed, will be handled gracefully
+
+// Helper for colorized output with fallback for environments without chalk
+const colors = {
+  info: (text) => {
+    try {
+      return chalk ? chalk.blue(text) : text;
+    } catch {
+      return text;
+    }
+  },
+  success: (text) => {
+    try {
+      return chalk ? chalk.green(text) : text;
+    } catch {
+      return text;
+    }
+  },
+  warning: (text) => {
+    try {
+      return chalk ? chalk.yellow(text) : text;
+    } catch {
+      return text;
+    }
+  },
+  error: (text) => {
+    try {
+      return chalk ? chalk.red(text) : text;
+    } catch {
+      return text;
+    }
+  },
+  highlight: (text) => {
+    try {
+      return chalk ? chalk.cyan(text) : text;
+    } catch {
+      return text;
+    }
+  },
+  dim: (text) => {
+    try {
+      return chalk ? chalk.gray(text) : text;
+    } catch {
+      return text;
+    }
+  },
+};
+
+// UI State
+const uiState = {
+  showAdvanced: false,
+  lastKeypress: Date.now(),
+  showHelp: false,
+  sessionStart: new Date(),
+  spinnerState: 0,
+  spinnerFrames: ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
+};
+
+// Helper to format numbers for display
+function formatNumber(num) {
+  if (num >= 1000000) {
+    return (num / 1000000).toFixed(1) + "M";
+  } else if (num >= 1000) {
+    return (num / 1000).toFixed(1) + "K";
+  }
+  return num.toString();
+}
+
+// Helper to format time elapsed
+function formatTimeElapsed(startTime) {
+  const elapsed = Math.floor((Date.now() - startTime) / 1000);
+  const hours = Math.floor(elapsed / 3600);
+  const minutes = Math.floor((elapsed % 3600) / 60);
+  const seconds = elapsed % 60;
+
+  if (hours > 0) {
+    return `${hours}h ${minutes}m`;
+  } else if (minutes > 0) {
+    return `${minutes}m ${seconds}s`;
+  } else {
+    return `${seconds}s`;
+  }
+}
+
+// Show help menu
+function showHelp() {
+  process.stdout.write("\n\n");
+  console.log(colors.highlight("=== Chrome Logger Help ==="));
+  console.log(colors.info("Available commands:"));
+  console.log(`  ${colors.success("h")} - Show/hide this help menu`);
+  console.log(`  ${colors.success("a")} - Toggle advanced metrics display`);
+  console.log(`  ${colors.success("f")} - Force flush all data to disk`);
+  console.log(`  ${colors.success("s")} - Show session summary`);
+  console.log(
+    `  ${colors.success("q")} - Quit (closes the logger, not Chrome)`
+  );
+  console.log("\nYour data is being saved to:");
+  console.log(
+    `  ${colors.highlight(sessionDir || "Session directory not yet created")}`
+  );
+  console.log("\nPress any key to return to the main display");
+}
+
+// Show a simplified status display
+function showSimpleStatus() {
+  // Get current spinner frame
+  uiState.spinnerState =
+    (uiState.spinnerState + 1) % uiState.spinnerFrames.length;
+  const spinner = uiState.spinnerFrames[uiState.spinnerState];
+
+  // Format time running
+  const timeRunning = formatTimeElapsed(uiState.sessionStart);
+
+  // Basic info
+  const networkCount = formatNumber(progressStats.networkEvents);
+  const consoleCount = formatNumber(progressStats.consoleLogs);
+  const errorWarningInfo =
+    progressStats.errorLogs > 0 || progressStats.warningLogs > 0
+      ? colors.warning(
+          `(${
+            progressStats.errorLogs > 0
+              ? colors.error(formatNumber(progressStats.errorLogs) + " errors")
+              : ""
+          }${
+            progressStats.errorLogs > 0 && progressStats.warningLogs > 0
+              ? ", "
+              : ""
+          }${
+            progressStats.warningLogs > 0
+              ? formatNumber(progressStats.warningLogs) + " warnings"
+              : ""
+          })`
+        )
+      : "";
+
+  // Create status line
+  let statusLine = `${colors.info(spinner)} Recording for ${colors.highlight(
+    timeRunning
+  )} | ${colors.success(networkCount)} requests | ${colors.success(
+    consoleCount
+  )} logs ${errorWarningInfo} | ${colors.info(progressStats.activeTabs)} tabs`;
+
+  // Return the basic status line if advanced info is not requested
+  if (!uiState.showAdvanced) {
+    statusLine += colors.dim(" | Press h for help");
+    return statusLine;
+  }
+
+  // Add advanced info if requested
+  const memoryUsage = process.memoryUsage();
+  const heapUsedMB = Math.round(memoryUsage.heapUsed / 1024 / 1024);
+  const heapTotalMB = Math.round(memoryUsage.heapTotal / 1024 / 1024);
+
+  statusLine += `\n${colors.dim(
+    "Mem:"
+  )} ${heapUsedMB}/${heapTotalMB}MB | ${colors.dim("Flushed:")} ${formatNumber(
+    flushStats.totalNetworkEventsFlushed
+  )} reqs, ${formatNumber(
+    Object.values(flushStats.totalConsoleLogsFlushed).reduce(
+      (sum, count) => sum + count,
+      0
+    )
+  )} logs`;
+
+  return statusLine;
+}
+
+// Replace updateStatusLine with enhanced version
 const updateStatusLine = throttle((force = false) => {
   const now = Date.now();
   // Only update if forced or if enough time has passed since last update
@@ -161,21 +329,110 @@ const updateStatusLine = throttle((force = false) => {
   process.stdout.clearLine();
   process.stdout.cursorTo(0);
 
-  // Format the counts with padding for alignment
-  const networkCount = String(progressStats.networkEvents).padStart(8);
-  const consoleCount = String(progressStats.consoleLogs).padStart(8);
-  const errorCount =
-    progressStats.errorLogs > 0 ? ` (${progressStats.errorLogs} errors)` : "";
-  const warningCount =
-    progressStats.warningLogs > 0
-      ? ` (${progressStats.warningLogs} warnings)`
-      : "";
+  // If help is showing, don't update status
+  if (uiState.showHelp) return;
 
   // Write the status line
-  process.stdout.write(
-    `Network: ${networkCount} | Console: ${consoleCount}${errorCount}${warningCount} | Tabs: ${progressStats.activeTabs}`
-  );
+  process.stdout.write(showSimpleStatus());
 }, progressStats.updateFrequencyMs);
+
+// Set up keyboard input handling
+function setupKeyboardHandling() {
+  if (process.stdin.isTTY) {
+    process.stdin.setRawMode(true);
+    process.stdin.setEncoding("utf8");
+
+    process.stdin.on("data", async (key) => {
+      // Detect Ctrl+C to exit
+      if (key === "\u0003") {
+        console.log("\nExiting...");
+        process.exit();
+      }
+
+      // Other key commands
+      switch (key.toLowerCase()) {
+        case "h": // Toggle help
+          uiState.showHelp = !uiState.showHelp;
+          if (uiState.showHelp) {
+            showHelp();
+          } else {
+            console.clear();
+            updateStatusLine(true);
+          }
+          break;
+
+        case "a": // Toggle advanced display
+          uiState.showAdvanced = !uiState.showAdvanced;
+          updateStatusLine(true);
+          break;
+
+        case "f": // Force flush
+          process.stdout.clearLine();
+          process.stdout.cursorTo(0);
+          console.log(colors.info("Manually flushing data to disk..."));
+          await performMemoryCheck(true);
+          updateStatusLine(true);
+          break;
+
+        case "s": // Show session summary
+          process.stdout.clearLine();
+          process.stdout.cursorTo(0);
+
+          console.log(colors.highlight("\n=== Session Summary ==="));
+          console.log(
+            `Running for: ${formatTimeElapsed(uiState.sessionStart)}`
+          );
+          console.log(`Active browser tabs: ${progressStats.activeTabs}`);
+          console.log(`Total network requests: ${progressStats.networkEvents}`);
+          console.log(`Total console logs: ${progressStats.consoleLogs}`);
+
+          if (progressStats.errorLogs > 0) {
+            console.log(
+              colors.error(`Errors detected: ${progressStats.errorLogs}`)
+            );
+          }
+          if (progressStats.warningLogs > 0) {
+            console.log(
+              colors.warning(`Warnings detected: ${progressStats.warningLogs}`)
+            );
+          }
+
+          console.log(
+            colors.info(`\nAll data is being saved to: ${sessionDir}`)
+          );
+          console.log(colors.dim("Press any key to continue..."));
+
+          // Wait for keypress to continue
+          await waitForKeypress();
+          console.clear();
+          updateStatusLine(true);
+          break;
+
+        case "q": // Quit (but keep Chrome running)
+          process.stdout.clearLine();
+          process.stdout.cursorTo(0);
+          console.log(colors.info("Saving final data and exiting..."));
+          // This will naturally exit when complete
+          // Force disconnect from browser to trigger cleanup
+          if (browser) {
+            browser.disconnect();
+          } else {
+            process.exit(0);
+          }
+          break;
+
+        default:
+          // Any other key just updates the UI
+          if (uiState.showHelp) {
+            uiState.showHelp = false;
+            console.clear();
+          }
+          updateStatusLine(true);
+          break;
+      }
+    });
+  }
+}
 
 // Function to find Chrome executable in the system
 const findChromeExecutable = () => {
@@ -991,6 +1248,7 @@ const flushNetworkEventsForTab = async (tabId, forceSave = false) => {
   const consoleLogs = {}; // Changed to an object that will group logs by tab ID
   pages = new Map(); // Assign to global
   const startTime = new Date();
+  uiState.sessionStart = startTime;
 
   // Define sessionDir in the global scope to ensure it's accessible in all functions
   const timestamp = new Date().toLocaleTimeString().replace(/[:.]/g, "-");
@@ -1635,7 +1893,17 @@ const flushNetworkEventsForTab = async (tabId, forceSave = false) => {
   };
 
   try {
-    console.log("Checking Chrome connection...");
+    console.clear(); // Start with a clean screen
+    console.log(colors.highlight("=== Chrome Logger ==="));
+    console.log(
+      colors.info(
+        "Capturing network traffic and console logs from Chrome browser..."
+      )
+    );
+    console.log(colors.info("Checking Chrome connection..."));
+
+    // Initialize keyboard handling
+    setupKeyboardHandling();
 
     // First check if Chrome is actually reachable
     let chromeStatus = await isChromeReachable();
@@ -1643,7 +1911,9 @@ const flushNetworkEventsForTab = async (tabId, forceSave = false) => {
     // If Chrome is not running with debug port, try to find and launch it
     if (!chromeStatus.success) {
       console.log(
-        "Chrome not running with debug port. Attempting to find and launch Chrome..."
+        colors.warning(
+          "Chrome not running with debug port. Attempting to find and launch Chrome..."
+        )
       );
       const chromePath = findChromeExecutable();
 
@@ -1657,18 +1927,34 @@ const flushNetworkEventsForTab = async (tabId, forceSave = false) => {
 
       // If Chrome is still not reachable, show error and exit
       if (!chromeStatus.success) {
-        console.error("❌ Cannot connect to Chrome on port 9222!");
-        console.log(
-          "Please make sure Chrome is running with remote debugging enabled."
+        console.error(
+          colors.error("❌ Cannot connect to Chrome on port 9222!")
         );
         console.log(
-          "Start Chrome with: chrome.exe --remote-debugging-port=9222"
+          colors.info(
+            "Please start Chrome with remote debugging enabled using one of these methods:"
+          )
         );
+        console.log(
+          colors.highlight("Method 1:") +
+            " Close Chrome and run this script again - it will try to launch Chrome for you"
+        );
+        console.log(
+          colors.highlight("Method 2:") +
+            " Start Chrome manually with this command:"
+        );
+        console.log(
+          "  " + colors.dim("chrome.exe --remote-debugging-port=9222")
+        );
+        console.log(colors.info("\nPress any key to exit..."));
+        await waitForKeypress();
         return;
       }
     }
 
-    console.log("✅ Chrome debug connection confirmed. Connecting...");
+    console.log(
+      colors.success("✅ Chrome debug connection confirmed. Connecting...")
+    );
 
     // Create timestamp for the session folder and files
     const timestamp = new Date().toLocaleTimeString().replace(/[:.]/g, "-");
@@ -1680,17 +1966,21 @@ const flushNetworkEventsForTab = async (tabId, forceSave = false) => {
     if (!fs.existsSync(sessionDir)) {
       try {
         fs.mkdirSync(sessionDir);
-        console.log(`Created session directory: ${sessionDir}`);
+        console.log(colors.dim(`Created session directory: ${sessionDir}`));
       } catch (err) {
-        console.error(`Failed to create session directory: ${err.message}`);
+        console.error(
+          colors.error(`Failed to create session directory: ${err.message}`)
+        );
         // Rather than falling back to __dirname, we can create a special error directory
         const errorDir = path.join(__dirname, `error_session_${timestamp}`);
         try {
           fs.mkdirSync(errorDir);
-          console.log(`Created error directory: ${errorDir}`);
+          console.log(colors.dim(`Created error directory: ${errorDir}`));
         } catch {
           console.error(
-            "Failed to create error directory, using current directory"
+            colors.error(
+              "Failed to create error directory, using current directory"
+            )
           );
         }
       }
@@ -1726,25 +2016,39 @@ const flushNetworkEventsForTab = async (tabId, forceSave = false) => {
     const activePagesArray = await browser.pages();
 
     if (activePagesArray.length === 0) {
-      console.log("No active pages found. Opening a new tab...");
+      console.log(colors.info("No active pages found. Opening a new tab..."));
       await browser.newPage();
       activePagesArray.push(await browser.pages()[0]);
     }
 
-    console.log(`Found ${activePagesArray.length} active browser pages`);
+    console.log(
+      colors.info(`Found ${activePagesArray.length} active browser tabs`)
+    );
 
     // Log the page titles and URLs to confirm multi-tab recording
     for (let i = 0; i < activePagesArray.length; i++) {
       try {
         const title = await activePagesArray[i].title();
         const url = await activePagesArray[i].url();
-        console.log(`Tab ${i + 1}: "${title}" - ${url}`);
+        console.log(
+          `  ${colors.highlight("•")} ${colors.success(
+            title || "Untitled"
+          )} - ${colors.dim(url)}`
+        );
       } catch {
-        console.log(`Tab ${i + 1}: [Unable to get details]`);
+        console.log(`  ${colors.highlight("•")} [Unable to get details]`);
       }
     }
 
-    console.log("Recording from ALL tabs shown above");
+    console.log(colors.success("\n✅ Recording from ALL tabs shown above"));
+    console.log(colors.info("Data will be saved to:"));
+    console.log(`  ${colors.highlight(sessionDir)}`);
+    console.log(
+      colors.dim(
+        "\nUse Chrome normally. This window will display activity statistics."
+      )
+    );
+    console.log(colors.dim("Press h for help and additional options.\n"));
 
     // Reset uniqueRequestId at the start of session
     uniqueRequestId = 0;
@@ -1803,15 +2107,10 @@ const flushNetworkEventsForTab = async (tabId, forceSave = false) => {
       }
     });
 
-    console.log(`Network and console recording started.`);
-    console.log(`Session directory: ${sessionDir}`);
-    console.log(`Final HAR file will be saved to: ${finalHarFilePath}`);
-    console.log(`Final console logs will be saved to: ${consoleLogsFilePath}`);
-    console.log("Use Chrome normally and close it when finished.");
     console.log(
-      `Memory management: Max ${MEMORY_CONFIG.maxEventsBeforeFlush} network events or ${MEMORY_CONFIG.maxLogsPerTabBeforeFlush} console logs per tab before auto-flush`
+      `${colors.success("✅")} Network and console recording started.`
     );
-    console.log("\nStarting event capture... (statistics below)");
+    console.clear();
 
     // Initialize the status line
     updateStatusLine(true);
