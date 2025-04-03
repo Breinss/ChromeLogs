@@ -15,6 +15,16 @@ let networkEvents;
 let pages;
 const requestUrlMaps = new Map(); // Map<tabId, Map<url, entry>>
 
+// Add flushStats as a global
+let flushStats = {
+  networkEventFlushes: 0,
+  totalNetworkEventsFlushed: 0,
+  perTabNetworkEventsFlushed: {}, // Track per-tab flush counts
+  consoleLogFlushes: 0,
+  totalConsoleLogsFlushed: {},
+  lastFlushTime: new Date(),
+};
+
 // Memory management configurations
 const MEMORY_CONFIG = {
   maxEventsBeforeFlush: 5000, // Max network events to keep in memory per tab
@@ -643,9 +653,9 @@ function formatHeaders(headers) {
     return headerCache.get(cacheKey);
   }
 
-  // Format headers
+  // Format headers - ensure name field is included
   const formatted = Object.entries(headers).map(([name, value]) => ({
-    name,
+    name, // Chrome includes the name field
     value: String(value),
   }));
 
@@ -685,64 +695,109 @@ function createHarFile(entries, pages) {
     const batch = eventsArray.slice(i, i + batchSize).map((entry) => {
       // Reuse timing object for better performance
       const timings = {
-        blocked: parseFloat((entry.timings.blocked || 0).toFixed(5)),
-        dns: entry.timings.dns || -1,
-        ssl: entry.timings.ssl || -1,
-        connect: entry.timings.connect || -1,
-        send: parseFloat((entry.timings.send || 0).toFixed(5)),
-        wait: parseFloat((entry.timings.wait || 0).toFixed(5)),
-        receive: parseFloat((entry.timings.receive || 0).toFixed(5)),
+        blocked: parseFloat((entry.timings?.blocked || 0).toFixed(5)),
+        dns: entry.timings?.dns || -1,
+        ssl: entry.timings?.ssl || -1,
+        connect: entry.timings?.connect || -1,
+        send: parseFloat((entry.timings?.send || 0).toFixed(5)),
+        wait: parseFloat((entry.timings?.wait || 0).toFixed(5)),
+        receive: parseFloat((entry.timings?.receive || 0).toFixed(5)),
         _blocked_queueing: parseFloat(
-          (entry.timings._blocked_queueing || 0).toFixed(5)
+          (entry.timings?._blocked_queueing || 0).toFixed(5)
         ),
+        // Add Chrome-specific timing fields
+        _workerStart: -1,
+        _workerReady: -1,
+        _workerFetchStart: -1,
+        _workerRespondWithSettled: -1,
       };
 
-      // Create a clean entry that matches Chrome's format - use minimal object properties
+      // Create a request object that matches Chrome's format
+      const request = entry.request || {};
+      const chromeRequest = {
+        method: request.method || "GET",
+        url: request.url || "",
+        httpVersion: request.httpVersion || "http/2.0",
+        headers: request.headers || [],
+        queryString: request.queryString || [],
+        cookies: request.cookies || [],
+        headersSize: request.headersSize || -1,
+        bodySize: request.bodySize || 0,
+      };
+
+      // Create a response object that matches Chrome's format
+      const response = entry.response || {};
+      const chromeResponse = {
+        status: response.status || 0,
+        statusText: response.statusText || "",
+        httpVersion: response.httpVersion || "http/2.0",
+        headers: response.headers || [],
+        cookies: response.cookies || [],
+        content: response.content || {
+          size: 0,
+          mimeType: response.mimeType || "",
+        },
+        redirectURL: response.redirectURL || "",
+        headersSize: response.headersSize || -1,
+        bodySize: response.bodySize || -1,
+        _transferSize: response._transferSize || 0,
+        _error: response._error || null,
+        _fetchedViaServiceWorker: false,
+      };
+
+      // Generate connection ID if not present (Chrome uses numeric strings)
+      const connectionId =
+        entry._connectionId ||
+        (entry.connection
+          ? entry.connection
+          : Math.floor(Math.random() * 9000 + 1000).toString());
+
+      // Create a clean entry that matches Chrome's format exactly
       return {
-        _initiator: { type: "script" },
-        _priority: entry._priority || "High",
+        _connectionId: connectionId,
+        _initiator: entry._initiator || {
+          type: "script",
+          stack: {
+            callFrames: [],
+            parentId: entry._initiator?.stack?.parentId || {},
+          },
+        },
+        _priority: entry._priority || "VeryHigh", // Chrome uses VeryHigh instead of High
         _resourceType: entry._resourceType || "other",
+        _requestId: entry._requestId,
+        pageref: entry.pageref,
         cache: {},
         connection: entry.connection || "443",
-        request: entry.request,
-        response: entry.response || {
-          status: 0,
-          statusText: "",
-          httpVersion: "http/1.1",
-          headers: [],
-          cookies: [],
-          content: { mimeType: "" },
-          redirectURL: "",
-          headersSize: -1,
-          bodySize: -1,
-          _transferSize: 0,
-          _error: null,
-        },
+        request: chromeRequest,
+        response: chromeResponse,
         serverIPAddress: entry.serverIPAddress || "",
         startedDateTime: entry.startedDateTime,
         time: parseFloat((entry.time || 0).toFixed(5)),
         timings: timings,
+        _timestamp: entry._timestamp || Date.now(),
       };
     });
 
     processedEntries.push(...batch);
   }
 
-  // Create a HAR file that matches Chrome's expected format - use minimal object
+  // Create a HAR file that matches Chrome's expected format
   return {
     log: {
       version: "1.2",
       creator: {
-        name: "WebInspector", // Match Chrome's creator name
-        version: "537.36", // Match Chrome's version
+        name: "WebInspector",
+        version: "1.0", // Chrome uses "1.0" in some cases, not "537.36"
       },
       pages: pages.map((page) => ({
-        startedDateTime: page.startedDateTime,
         id: page.id,
         title: page.title || "",
+        startedDateTime: page.startedDateTime,
+        url: page.url || "",
+        // Add these fields that Chrome includes
         pageTimings: {
-          onContentLoad: -1,
-          onLoad: -1,
+          onContentLoad: page.pageTimings?.onContentLoad || -1,
+          onLoad: page.pageTimings?.onLoad || -1,
         },
       })),
       entries: processedEntries,
@@ -973,274 +1028,21 @@ function saveConsoleLogs(filePath, logs) {
   }
 }
 
-// Save final HAR files - one per tab
-const saveFinalHarFiles = () => {
-  return new Promise(async (resolve, reject) => {
-    try {
-      // Create har directory - use let instead of const since we might need to change it
-      let harDir = path.join(sessionDir, "final_har_files");
-      if (!fs.existsSync(harDir)) {
-        try {
-          fs.mkdirSync(harDir, { recursive: true });
-        } catch (dirErr) {
-          console.error(`Failed to create HAR directory: ${dirErr.message}`);
-          // Fall back to session directory
-          harDir = sessionDir;
-        }
-      }
-
-      // Process tabs in parallel for better performance
-      const savePromises = [];
-
-      // Process each tab
-      for (const [tabId, tabEvents] of networkEvents.entries()) {
-        // Skip empty tabs
-        if (tabEvents.length === 0) continue;
-
-        const tabInfo = pages.get(tabId) || {
-          id: tabId,
-          title: "Unknown Tab",
-          url: "unknown",
-          startedDateTime: new Date().toISOString(),
-        };
-
-        // Get base URL for filename
-        let baseUrl = "unknown-domain";
-        if (tabUrlStats.has(tabId)) {
-          const tabUrlStat = tabUrlStats.get(tabId);
-          baseUrl =
-            tabUrlStat.primaryBaseUrl ||
-            tabUrlStat.lastBaseUrl ||
-            "unknown-domain";
-        }
-
-        // Create a clean filename
-        const cleanBaseUrl = getCleanFilenameFromUrl(baseUrl, tabId);
-
-        // Generate HAR file path with base URL as name
-        const harFilePath = path.join(harDir, `${cleanBaseUrl}.har`);
-
-        // Create HAR data from events for this tab
-        const harData = createHarFile(tabEvents, [tabInfo]);
-
-        // Use optimized async file write
-        const savePromise = writeCompressedFile(harFilePath, harData)
-          .then(() => {
-            console.log(
-              `Saved HAR file for tab "${tabInfo.title}" to: ${harFilePath}`
-            );
-          })
-          .catch((err) => {
-            console.error(
-              `Error saving HAR for tab "${tabInfo.title}": ${err.message}`
-            );
-          });
-
-        savePromises.push(savePromise);
-      }
-
-      // Also create a combined HAR file for convenience
-      const combinedHarPath = path.join(sessionDir, "network_all.har");
-
-      // Flatten all events from all tabs into a single array - safely check for iterability
-      const allEvents = [];
-      for (const events of networkEvents.values()) {
-        // Check if events is an array or array-like iterable before spreading
-        if (events && Array.isArray(events)) {
-          if (events.length > 0) {
-            allEvents.push(...events);
-          }
-        } else if (
-          events &&
-          typeof events === "object" &&
-          events.array &&
-          Array.isArray(events.array)
-        ) {
-          // Handle BoundedArray objects which store their items in an 'array' property
-          if (events.array.length > 0) {
-            allEvents.push(...events.array);
-          }
-        } else if (events && typeof events.getItems === "function") {
-          // Handle objects with a getItems() method that returns an array (like BoundedArray)
-          const items = events.getItems();
-          if (Array.isArray(items) && items.length > 0) {
-            allEvents.push(...items);
-          }
-        }
-      }
-
-      // Create combined HAR file with the array of events
-      const combinedHarData = createHarFile(
-        allEvents,
-        Array.from(pages.values())
-      );
-
-      // Add the combined HAR save to our promises
-      const combinedSavePromise = writeCompressedFile(
-        combinedHarPath,
-        combinedHarData
-      )
-        .then(() => {
-          console.log(`Saved combined HAR file to: ${combinedHarPath}`);
-        })
-        .catch((err) => {
-          console.error(`Error saving combined HAR: ${err.message}`);
-        });
-
-      savePromises.push(combinedSavePromise);
-
-      // Wait for all save operations to complete
-      await Promise.allSettled(savePromises);
-      resolve();
-    } catch (e) {
-      console.error(`Error saving final HAR files: ${e.message}`);
-      reject(e);
-    }
-  });
-};
-
 // Helper function for compressed writes
 function writeCompressedFile(filePath, data) {
   return new Promise((resolve, reject) => {
+    // Skip compression for now to reduce complexity
     try {
-      // For small files, use synchronous write for simplicity
-      if (
-        MEMORY_CONFIG.useCompression &&
-        typeof data === "object" &&
-        Object.keys(data).length > 10
-      ) {
-        const zlib = getZlib();
-        const gzip = zlib.createGzip();
-        const compressedPath = `${filePath}.gz`;
-        const fileStream = fs.createWriteStream(compressedPath);
-
-        // Handle stream errors
-        fileStream.on("error", (err) => {
-          // Try fallback to sync write if streaming fails
-          try {
-            fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
-            resolve(filePath);
-          } catch (fallbackErr) {
-            reject(
-              new Error(
-                `Stream error: ${err.message}, Fallback error: ${fallbackErr.message}`
-              )
-            );
-          }
-        });
-
-        const jsonString = JSON.stringify(data);
-        const dataStream = require("stream").Readable.from([jsonString]);
-
-        dataStream.pipe(gzip).pipe(fileStream);
-
-        fileStream.on("finish", () => resolve(compressedPath));
-      } else {
-        // For small data or when compression is disabled, use sync write
-        fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+      if (writeFile(filePath, data)) {
         resolve(filePath);
+      } else {
+        reject(new Error("Failed to write file"));
       }
-    } catch (e) {
-      // Fall back to a simpler approach if error occurs
-      try {
-        fs.writeFileSync(filePath + ".backup", JSON.stringify(data));
-        resolve(filePath + ".backup");
-      } catch (backupErr) {
-        reject(
-          new Error(
-            `Original error: ${e.message}, Backup error: ${backupErr.message}`
-          )
-        );
-      }
+    } catch (err) {
+      reject(err);
     }
   });
 }
-
-// Function to flush network events to disk for a specific tab and clear memory
-const flushNetworkEventsForTab = async (tabId, forceSave = false) => {
-  try {
-    if (!sessionDir || !networkEvents.has(tabId)) {
-      return; // Skip if directory not set or no events for this tab
-    }
-
-    const tabEvents = networkEvents.get(tabId);
-
-    // Skip if not enough events to flush (unless forced)
-    if (tabEvents.length < MEMORY_CONFIG.maxEventsBeforeFlush && !forceSave) {
-      return;
-    }
-
-    // Get tab information
-    let tabInfo = pages.get(tabId) || {
-      id: tabId,
-      title: "Unknown Tab",
-      url: "unknown",
-      startedDateTime: new Date().toISOString(),
-    };
-
-    // Get base URL for filename
-    let baseUrl = "unknown-domain";
-    if (tabUrlStats.has(tabId)) {
-      const tabUrlStat = tabUrlStats.get(tabId);
-      baseUrl =
-        tabUrlStat.primaryBaseUrl || tabUrlStat.lastBaseUrl || "unknown-domain";
-    }
-
-    // Create a clean filename
-    const cleanBaseUrl = getCleanFilenameFromUrl(baseUrl, tabId);
-
-    // Create flush directory if needed
-    const flushDir = path.join(sessionDir, "network_flushes");
-    if (!fs.existsSync(flushDir)) {
-      fs.mkdirSync(flushDir, { recursive: true });
-    }
-
-    // Create a unique flush filename
-    const tabFlushCount = flushStats.perTabNetworkEventsFlushed[tabId] || 0;
-    const flushFilePath = path.join(
-      flushDir,
-      `${cleanBaseUrl}_flush_${tabFlushCount + 1}.har`
-    );
-
-    // Create HAR file from current events for this tab
-    const harData = createHarFile(tabEvents, [tabInfo]);
-
-    // Use optimized write function
-    await writeCompressedFile(flushFilePath, harData);
-
-    // Update stats
-    flushStats.perTabNetworkEventsFlushed[tabId] = tabFlushCount + 1;
-    flushStats.totalNetworkEventsFlushed += tabEvents.length;
-    flushStats.networkEventFlushes++;
-    flushStats.lastFlushTime = new Date();
-
-    // Clear current line and show flush message on its own line
-    process.stdout.clearLine();
-    process.stdout.cursorTo(0);
-    console.log(
-      `Memory management: Flushed ${tabEvents.length} network events for tab "${tabInfo.title}" (${baseUrl}) to disk`
-    );
-
-    // Clear memory for this tab
-    networkEvents.set(tabId, []);
-
-    // Store reference to the flush file in tab info
-    if (!tabInfo.networkFlushFiles) {
-      tabInfo.networkFlushFiles = [];
-    }
-    tabInfo.networkFlushFiles.push(flushFilePath);
-
-    // Restore status line
-    updateStatusLine(true);
-  } catch (e) {
-    process.stdout.clearLine();
-    process.stdout.cursorTo(0);
-    console.error(
-      `Failed to flush network events for tab ${tabId}: ${e.message}`
-    );
-    updateStatusLine(true);
-  }
-};
 
 // Helper function to fetch Chrome WebSocket URL manually without using fetch
 function fetchChromeWebSocketUrl() {
@@ -1325,7 +1127,7 @@ function fetchChromeWebSocketUrl() {
   }
 
   // Track flush counts for reporting
-  const flushStats = {
+  flushStats = {
     networkEventFlushes: 0,
     totalNetworkEventsFlushed: 0,
     perTabNetworkEventsFlushed: {}, // Track per-tab flush counts
@@ -1615,15 +1417,23 @@ function fetchChromeWebSocketUrl() {
           // Use lightweight object with only necessary fields
           tabEvents.push({
             _requestId: String(uniqueRequestId),
-            _priority: "High",
+            _priority: "VeryHigh", // Match Chrome's priority naming
             _resourceType: request.resourceType(),
+            _connectionId: Math.floor(Math.random() * 9000 + 1000).toString(), // Generate a Chrome-like ID
+            _initiator: {
+              type: "script",
+              stack: {
+                callFrames: [],
+                parentId: {},
+              },
+            },
             pageref: pageId,
             startedDateTime: startedDateTime,
             time: 0,
             request: {
               method: request.method(),
               url: request.url(),
-              httpVersion: "HTTP/1.1",
+              httpVersion: "http/2.0", // Chrome uses http/2.0 instead of HTTP/1.1
               headers: headerArray,
               queryString: extractQueryString(request.url()),
               cookies: [],
@@ -2071,44 +1881,53 @@ function fetchChromeWebSocketUrl() {
         });
     } catch (err) {
       console.error(
-        `Cannot write to directory ${sessionDir}. Error: ${err.message}`
+        colors.error(`Directory write test failed: ${err.message}`)
+      );
+      console.error(colors.error("Attempting to use alternative directory..."));
+
+      // Try to create and use an alternative directory
+      const altDir = path.join(os.tmpdir(), `chrome_logs_${timestamp}`);
+      try {
+        fs.mkdirSync(altDir, { recursive: true });
+        sessionDir = altDir;
+        console.log(colors.dim(`Using alternative directory: ${sessionDir}`));
+      } catch (innerErr) {
+        console.error(
+          colors.error(
+            `Failed to create alternative directory: ${innerErr.message}`
+          )
+        );
+        console.error(
+          colors.error("Will attempt to use current directory as fallback")
+        );
+        sessionDir = getAppDir();
+      }
+    }
+
+    // Connect to Chrome using the WebSocket URL
+    console.log(colors.info("Connecting to Chrome..."));
+
+    let browserWSEndpoint;
+    try {
+      browserWSEndpoint = chromeStatus.url || (await fetchChromeWebSocketUrl());
+      if (!browserWSEndpoint) {
+        throw new Error("Could not get WebSocket URL");
+      }
+    } catch (err) {
+      console.error(
+        colors.error(`Failed to get WebSocket URL: ${err.message}`)
       );
       return;
     }
 
-    // Connect to Chrome using the confirmed WebSocket URL if available
-    try {
-      // Manually fetch the WebSocket URL instead of relying on Puppeteer's implementation
-      const webSocketUrl = await fetchChromeWebSocketUrl();
-      console.log(colors.dim(`Using WebSocket URL: ${webSocketUrl}`));
+    // Connect to the browser using puppeteer
+    browser = await puppeteer.connect({
+      browserWSEndpoint,
+      defaultViewport: null,
+    });
 
-      browser = await puppeteer.connect({
-        browserWSEndpoint: webSocketUrl,
-        defaultViewport: null,
-      });
-    } catch (wsError) {
-      console.error(
-        colors.error(`Failed to get WebSocket URL: ${wsError.message}`)
-      );
-      console.log(
-        colors.info("Falling back to browserURL connection method...")
-      );
-
-      // Try the original method as fallback
-      browser = await puppeteer.connect({
-        browserURL: "http://localhost:9222",
-        defaultViewport: null,
-      });
-    }
-
-    // Get all browser pages
+    // Get all pages (tabs)
     const activePagesArray = await browser.pages();
-
-    if (activePagesArray.length === 0) {
-      console.log(colors.info("No active pages found. Opening a new tab..."));
-      await browser.newPage();
-      activePagesArray.push(await browser.pages()[0]);
-    }
 
     console.log(
       colors.info(`Found ${activePagesArray.length} active browser tabs`)
@@ -2207,112 +2026,25 @@ function fetchChromeWebSocketUrl() {
     // Set up auto-save timer
     const autoSaveInterval = setInterval(() => {
       try {
-        // Perform memory check and flush only if necessary
         const now = Date.now();
         const timeSinceLastFlush = now - flushStats.lastFlushTime;
 
-        // Only do full flush check if enough time has passed
-        if (timeSinceLastFlush > MEMORY_CONFIG.autoFlushIntervalMs / 2) {
-          performMemoryCheck();
-        }
-
-        // Use partial flush for tabs with very high activity without requiring full memory check
-        for (const [tabId, tabEvents] of networkEvents.entries()) {
-          if (tabEvents.length >= MEMORY_CONFIG.maxEventsBeforeFlush * 0.9) {
-            flushNetworkEventsForTab(tabId);
+        if (timeSinceLastFlush > MEMORY_CONFIG.autoFlushIntervalMs) {
+          // Just do the flushes
+          for (const [tabId, tabEvents] of networkEvents.entries()) {
+            if (tabEvents.length > 0) {
+              flushNetworkEventsForTab(tabId, false);
+            }
           }
-        }
 
-        // Save current summary HAR data without interrupting status line
-        const partialHarFilePath = finalHarFilePath + ".part";
-
-        // Only create this partial file with a limited subset of network events
-        // to avoid memory pressure during large recording sessions
-
-        // Create an array with max 1000 events for the partial file
-        const sampleSize = 1000;
-        let allEventsSample = [];
-
-        for (const [tabId, tabEvents] of networkEvents.entries()) {
-          if (tabEvents.length > 0) {
-            // Take a proportional sample from each tab
-            const tabSampleSize = Math.min(
-              tabEvents.length,
-              Math.floor(
-                sampleSize * (tabEvents.length / progressStats.networkEvents)
-              )
-            );
-
-            if (tabSampleSize > 0) {
-              // Take most recent events for the sample
-              const startIndex = Math.max(0, tabEvents.length - tabSampleSize);
-              allEventsSample.push(...tabEvents.slice(startIndex));
+          for (const tabId of Object.keys(consoleLogs)) {
+            if (consoleLogs[tabId].logs?.length > 0) {
+              flushConsoleLogsForTab(tabId, false);
             }
           }
         }
-
-        // Limit total sample size
-        if (allEventsSample.length > sampleSize) {
-          allEventsSample = allEventsSample.slice(-sampleSize);
-        }
-
-        // Create HAR with the sample array
-        const harData = createHarFile(
-          allEventsSample,
-          Array.from(pages.values())
-        );
-
-        // Use optimized write
-        if (MEMORY_CONFIG.useBufferedWrites) {
-          writeCompressedFile(partialHarFilePath, harData);
-        } else {
-          fs.writeFileSync(
-            partialHarFilePath,
-            JSON.stringify(harData, null, 2)
-          );
-        }
-
-        // Create summary file of current state - simplified to reduce memory usage
-        const statusFilePath = path.join(sessionDir, "recording_status.json");
-
-        // Calculate current console logs across all tabs
-        const currentConsoleLogs = Object.keys(consoleLogs).reduce(
-          (sum, tabId) =>
-            sum +
-            (consoleLogs[tabId].logs ? consoleLogs[tabId].logs.length : 0),
-          0
-        );
-
-        // Calculate total console logs flushed
-        const totalConsoleLogsFlushed = Object.values(
-          flushStats.totalConsoleLogsFlushed
-        ).reduce((sum, count) => sum + count, 0);
-
-        const statusData = {
-          timestamp: new Date().toLocaleTimeString(),
-          runningFor: `${Math.round(
-            (new Date() - startTime) / 1000 / 60
-          )} minutes`,
-          activeTabs: progressStats.activeTabs,
-          currentNetworkEvents: networkEvents.size,
-          totalNetworkEvents: progressStats.networkEvents,
-          totalNetworkEventsFlushed: flushStats.totalNetworkEventsFlushed,
-          currentConsoleLogs,
-          totalConsoleLogs: progressStats.consoleLogs,
-          totalConsoleLogsFlushed,
-          totalErrorLogs: progressStats.errorLogs,
-          totalWarningLogs: progressStats.warningLogs,
-          lastFlushTime: flushStats.lastFlushTime.toLocaleTimeString(),
-        };
-
-        fs.writeFileSync(statusFilePath, JSON.stringify(statusData, null, 2));
       } catch (e) {
-        // Clear the status line to show error
-        process.stdout.clearLine();
-        process.stdout.cursorTo(0);
-        console.error("Error during auto-save:", e);
-        // Restore status line
-        updateStatusLine(true);
+        console.error("Error during flush:", e);
       }
     }, MEMORY_CONFIG.autoFlushIntervalMs);
 
@@ -2490,175 +2222,3 @@ function fetchChromeWebSocketUrl() {
 })();
 
 // Helper function for safe evaluation with timeout
-function safeEvaluate(handle, timeout = 500) {
-  return Promise.race([
-    handle.evaluate((obj) => {
-      try {
-        if (obj === null) return "null";
-        if (obj === undefined) return "undefined";
-        if (typeof obj === "object") {
-          try {
-            // Limit serialization depth for large objects
-            return JSON.stringify(obj, (k, v) => {
-              // Prevent circular references and limit depth
-              return k && typeof v === "object" && Object.keys(v).length > 20
-                ? "[Complex Object]"
-                : v;
-            });
-          } catch {
-            return String(obj);
-          }
-        }
-        return String(obj);
-      } catch {
-        return "[UnserializableValue]";
-      }
-    }),
-    new Promise((resolve) => setTimeout(() => resolve("[Timeout]"), timeout)),
-  ]).catch(() => "[EvaluationError]");
-}
-
-function streamHarFile(entries, pages, outputStream) {
-  // Convert entries to array if it's not already
-  const entriesArray = Array.isArray(entries)
-    ? entries
-    : entries instanceof Map
-    ? Array.from(entries.values()).flat()
-    : [];
-
-  // Write HAR file header
-  outputStream.write(
-    '{"log":{"version":"1.2","creator":{"name":"WebInspector","version":"537.36"},"pages":'
-  );
-
-  // Stream pages as JSON
-  const pagesJson = JSON.stringify(
-    pages.map((page) => ({
-      startedDateTime: page.startedDateTime,
-      id: page.id,
-      title: page.title || "",
-      pageTimings: { onContentLoad: -1, onLoad: -1 },
-    }))
-  );
-  outputStream.write(pagesJson);
-
-  // Start entries array
-  outputStream.write(',"entries":[');
-
-  // Stream entries in batches
-  const batchSize = MEMORY_CONFIG.batchSize || 100;
-  const totalEntries = entriesArray.length;
-
-  return new Promise((resolve, reject) => {
-    let processed = 0;
-
-    function processNextBatch() {
-      if (processed >= totalEntries) {
-        // Close entries array and HAR object
-        outputStream.write("]}");
-        resolve();
-        return;
-      }
-
-      const batch = entriesArray.slice(
-        processed,
-        Math.min(processed + batchSize, totalEntries)
-      );
-      processed += batch.length;
-
-      // Process batch and write to stream with appropriate commas
-      const batchJson = batch
-        .map((entry, i) => {
-          // Format entry as in createHarFile function
-          const formatted = {
-            /* formatted entry */
-          };
-
-          // Add comma for all but the last entry of the last batch
-          const isLastEntry =
-            processed >= totalEntries && i === batch.length - 1;
-          return JSON.stringify(formatted) + (isLastEntry ? "" : ",");
-        })
-        .join("");
-
-      // Write batch to stream
-      outputStream.write(batchJson);
-
-      // Schedule next batch with setImmediate to avoid blocking
-      setImmediate(processNextBatch);
-    }
-
-    processNextBatch();
-  });
-}
-
-// Use lazy loading
-function getZlib() {
-  if (!getZlib.module) {
-    getZlib.module = require("zlib");
-  }
-  return getZlib.module;
-}
-
-// Get application directory - works in both development and packaged environments
-function getAppDir() {
-  // Always use the directory where the executable is located
-  return path.dirname(process.execPath);
-}
-
-// Helper to get a valid path where we can write files
-function getWritablePath(desiredPath) {
-  try {
-    // Test if the path exists and is writable
-    if (fs.existsSync(desiredPath)) {
-      // Test write permissions by creating a temp file
-      const testFile = path.join(desiredPath, ".write-test");
-      fs.writeFileSync(testFile, "test");
-      fs.unlinkSync(testFile);
-      return desiredPath;
-    }
-
-    // If path doesn't exist, try to create it
-    fs.mkdirSync(desiredPath, { recursive: true });
-    return desiredPath;
-  } catch (err) {
-    console.log(
-      colors.warning(`Cannot write to ${desiredPath}: ${err.message}`)
-    );
-
-    // Fall back to appropriate OS-specific user data directory
-    try {
-      let fallbackDir;
-      if (process.platform === "win32") {
-        fallbackDir = path.join(
-          process.env.APPDATA || process.env.USERPROFILE,
-          "ChromeLogs"
-        );
-      } else if (process.platform === "darwin") {
-        fallbackDir = path.join(
-          process.env.HOME,
-          "Library",
-          "Application Support",
-          "ChromeLogs"
-        );
-      } else {
-        fallbackDir = path.join(process.env.HOME, ".chromelogs");
-      }
-
-      // Create the directory if it doesn't exist
-      if (!fs.existsSync(fallbackDir)) {
-        fs.mkdirSync(fallbackDir, { recursive: true });
-      }
-
-      return fallbackDir;
-    } catch (fallbackErr) {
-      // Last resort: use temp directory
-      const os = require("os");
-      const tempDir = path.join(os.tmpdir(), "ChromeLogs");
-      if (!fs.existsSync(tempDir)) {
-        fs.mkdirSync(tempDir, { recursive: true });
-      }
-      return tempDir;
-    }
-  }
-}
