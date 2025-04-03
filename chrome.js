@@ -1,4 +1,4 @@
-const puppeteer = require("puppeteer");
+const puppeteer = require("puppeteer-core");
 const fs = require("fs");
 const path = require("path");
 const http = require("http");
@@ -6,7 +6,7 @@ const { execSync, spawn } = require("child_process");
 const os = require("os");
 const { StringDecoder } = require("string_decoder");
 const { Readable, Transform } = require("stream");
-
+const SKIP_CHROMIUM_DOWNLOAD = true;
 // Global variables
 let uniqueRequestId = 0; // Moved to global scope so it's accessible in all functions and new tabs
 // Add sessionDir as a truly global variable
@@ -146,6 +146,7 @@ class BoundedArray {
 
 // Add to utility functions
 const chalk = require("chalk"); // If not installed, will be handled gracefully
+chalk.level = 1;
 
 // Helper for colorized output with fallback for environments without chalk
 const colors = {
@@ -1241,6 +1242,44 @@ const flushNetworkEventsForTab = async (tabId, forceSave = false) => {
   }
 };
 
+// Helper function to fetch Chrome WebSocket URL manually without using fetch
+function fetchChromeWebSocketUrl() {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      {
+        hostname: "localhost",
+        port: 9222,
+        path: "/json/version",
+        method: "GET",
+      },
+      (res) => {
+        let data = "";
+        res.on("data", (chunk) => (data += chunk));
+        res.on("end", () => {
+          try {
+            const wsUrl = JSON.parse(data).webSocketDebuggerUrl;
+            if (!wsUrl) {
+              reject(new Error("WebSocket URL not found in Chrome response"));
+            } else {
+              resolve(wsUrl);
+            }
+          } catch (err) {
+            reject(
+              new Error(`Failed to parse Chrome response: ${err.message}`)
+            );
+          }
+        });
+      }
+    );
+
+    req.on("error", (err) => {
+      reject(new Error(`HTTP request failed: ${err.message}`));
+    });
+
+    req.end();
+  });
+}
+
 // Main function
 (async () => {
   let browser = null;
@@ -1252,7 +1291,38 @@ const flushNetworkEventsForTab = async (tabId, forceSave = false) => {
 
   // Define sessionDir in the global scope to ensure it's accessible in all functions
   const timestamp = new Date().toLocaleTimeString().replace(/[:.]/g, "-");
-  sessionDir = path.join(__dirname, `session_${timestamp}`); // Use the global variable defined earlier
+
+  // Get base directory for outputs
+  const baseDir = getWritablePath(path.join(getAppDir(), "sessions"));
+  sessionDir = path.join(baseDir, `session_${timestamp}`);
+
+  // Create the directory if it doesn't exist
+  if (!fs.existsSync(sessionDir)) {
+    try {
+      fs.mkdirSync(sessionDir, { recursive: true });
+      console.log(colors.dim(`Created session directory: ${sessionDir}`));
+    } catch (err) {
+      console.error(
+        colors.error(`Failed to create session directory: ${err.message}`)
+      );
+      // Fall back to a different location
+      sessionDir = path.join(
+        getWritablePath(os.tmpdir()),
+        `chrome_logs_${timestamp}`
+      );
+      try {
+        fs.mkdirSync(sessionDir, { recursive: true });
+        console.log(colors.dim(`Created fallback directory: ${sessionDir}`));
+      } catch (innerErr) {
+        console.error(
+          colors.error(
+            `Failed to create fallback directory: ${innerErr.message}`
+          )
+        );
+        sessionDir = getAppDir(); // Last resort: use current directory
+      }
+    }
+  }
 
   // Track flush counts for reporting
   const flushStats = {
@@ -1960,7 +2030,7 @@ const flushNetworkEventsForTab = async (tabId, forceSave = false) => {
     const timestamp = new Date().toLocaleTimeString().replace(/[:.]/g, "-");
 
     // Create a new directory for this session
-    sessionDir = path.join(__dirname, `session_${timestamp}`);
+    sessionDir = path.join(getAppDir(), `session_${timestamp}`);
 
     // Create the directory if it doesn't exist
     if (!fs.existsSync(sessionDir)) {
@@ -1972,7 +2042,7 @@ const flushNetworkEventsForTab = async (tabId, forceSave = false) => {
           colors.error(`Failed to create session directory: ${err.message}`)
         );
         // Rather than falling back to __dirname, we can create a special error directory
-        const errorDir = path.join(__dirname, `error_session_${timestamp}`);
+        const errorDir = path.join(getAppDir(), `error_session_${timestamp}`);
         try {
           fs.mkdirSync(errorDir);
           console.log(colors.dim(`Created error directory: ${errorDir}`));
@@ -2007,10 +2077,29 @@ const flushNetworkEventsForTab = async (tabId, forceSave = false) => {
     }
 
     // Connect to Chrome using the confirmed WebSocket URL if available
-    browser = await puppeteer.connect({
-      browserURL: "http://localhost:9222",
-      defaultViewport: null,
-    });
+    try {
+      // Manually fetch the WebSocket URL instead of relying on Puppeteer's implementation
+      const webSocketUrl = await fetchChromeWebSocketUrl();
+      console.log(colors.dim(`Using WebSocket URL: ${webSocketUrl}`));
+
+      browser = await puppeteer.connect({
+        browserWSEndpoint: webSocketUrl,
+        defaultViewport: null,
+      });
+    } catch (wsError) {
+      console.error(
+        colors.error(`Failed to get WebSocket URL: ${wsError.message}`)
+      );
+      console.log(
+        colors.info("Falling back to browserURL connection method...")
+      );
+
+      // Try the original method as fallback
+      browser = await puppeteer.connect({
+        browserURL: "http://localhost:9222",
+        defaultViewport: null,
+      });
+    }
 
     // Get all browser pages
     const activePagesArray = await browser.pages();
@@ -2242,7 +2331,7 @@ const flushNetworkEventsForTab = async (tabId, forceSave = false) => {
               "Session directory doesn't exist. Creating emergency directory."
             );
             const emergencyDir = path.join(
-              __dirname,
+              getAppDir(),
               `emergency_${new Date()
                 .toLocaleTimeString()
                 .replace(/[:.]/g, "-")}`
@@ -2256,7 +2345,7 @@ const flushNetworkEventsForTab = async (tabId, forceSave = false) => {
                 `Failed to create emergency directory: ${dirErr.message}`
               );
               // Fall back to current directory
-              sessionDir = __dirname;
+              sessionDir = getAppDir();
             }
           }
 
@@ -2353,7 +2442,7 @@ const flushNetworkEventsForTab = async (tabId, forceSave = false) => {
         const timestamp = new Date().toLocaleTimeString().replace(/[:.]/g, "-");
 
         // Create emergency directory
-        const emergencyDir = path.join(__dirname, `emergency_${timestamp}`);
+        const emergencyDir = path.join(getAppDir(), `emergency_${timestamp}`);
         if (!fs.existsSync(emergencyDir)) {
           try {
             fs.mkdirSync(emergencyDir);
@@ -2364,7 +2453,9 @@ const flushNetworkEventsForTab = async (tabId, forceSave = false) => {
           }
         }
 
-        const saveDir = fs.existsSync(emergencyDir) ? emergencyDir : __dirname;
+        const saveDir = fs.existsSync(emergencyDir)
+          ? emergencyDir
+          : getAppDir();
 
         if (networkEvents && networkEvents.size > 0) {
           const allEvents = Array.from(networkEvents.values()).flat();
@@ -2507,4 +2598,67 @@ function getZlib() {
     getZlib.module = require("zlib");
   }
   return getZlib.module;
+}
+
+// Get application directory - works in both development and packaged environments
+function getAppDir() {
+  // Always use the directory where the executable is located
+  return path.dirname(process.execPath);
+}
+
+// Helper to get a valid path where we can write files
+function getWritablePath(desiredPath) {
+  try {
+    // Test if the path exists and is writable
+    if (fs.existsSync(desiredPath)) {
+      // Test write permissions by creating a temp file
+      const testFile = path.join(desiredPath, ".write-test");
+      fs.writeFileSync(testFile, "test");
+      fs.unlinkSync(testFile);
+      return desiredPath;
+    }
+
+    // If path doesn't exist, try to create it
+    fs.mkdirSync(desiredPath, { recursive: true });
+    return desiredPath;
+  } catch (err) {
+    console.log(
+      colors.warning(`Cannot write to ${desiredPath}: ${err.message}`)
+    );
+
+    // Fall back to appropriate OS-specific user data directory
+    try {
+      let fallbackDir;
+      if (process.platform === "win32") {
+        fallbackDir = path.join(
+          process.env.APPDATA || process.env.USERPROFILE,
+          "ChromeLogs"
+        );
+      } else if (process.platform === "darwin") {
+        fallbackDir = path.join(
+          process.env.HOME,
+          "Library",
+          "Application Support",
+          "ChromeLogs"
+        );
+      } else {
+        fallbackDir = path.join(process.env.HOME, ".chromelogs");
+      }
+
+      // Create the directory if it doesn't exist
+      if (!fs.existsSync(fallbackDir)) {
+        fs.mkdirSync(fallbackDir, { recursive: true });
+      }
+
+      return fallbackDir;
+    } catch (fallbackErr) {
+      // Last resort: use temp directory
+      const os = require("os");
+      const tempDir = path.join(os.tmpdir(), "ChromeLogs");
+      if (!fs.existsSync(tempDir)) {
+        fs.mkdirSync(tempDir, { recursive: true });
+      }
+      return tempDir;
+    }
+  }
 }

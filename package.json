@@ -1,0 +1,24 @@
+{
+  "name": "chromelogs",
+  "version": "1.0.0",
+  "description": "A automated HAR and Console logs exporter for Google Chrome",
+  "homepage": "https://github.com/Breinss/ChromeLogs#readme",
+  "bugs": {
+    "url": "https://github.com/Breinss/ChromeLogs/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Breinss/ChromeLogs.git"
+  },
+  "license": "ISC",
+  "author": "Brean",
+  "type": "commonjs",
+  "main": "chrome.js",
+  "scripts": {
+    "start": "node chrome.js",
+    "build:win": "pkg -t node16-win-x64 chrome.js -o dist/chrome-logger.exe",
+    "build:mac": "pkg -t node16-macos-x64 chrome.js -o dist/chrome-logger-mac",
+    "build:linux": "pkg -t node16-linux-x64 chrome.js -o dist/chrome-logger-linux",
+    "build": "npm run build:win"
+  }
+}
